@@ -24,6 +24,8 @@
 #include "LuaExtension.h"
 #include "DebugManager.h"
 #include "SessionManager.h"
+#include "TranslationManager.h"
+#include "ApplicationSettings.h"
 
 #include "LuaState.h"
 #include "lua.hpp"
@@ -35,7 +37,8 @@
 #include "Lexilla.h"
 
 #include <QCommandLineParser>
-#include <QSettings>
+
+#include <QDirIterator>
 
 #ifdef Q_OS_WIN
 #include <Windows.h>
@@ -68,9 +71,16 @@ void parseCommandLine(QCommandLineParser &parser, const QStringList &args)
     parser.addOptions({
         {"translation", "Overrides the system default translation.", "translation"},
         {"reset-settings", "Resets all application settings."},
+        {"n", "Places the cursor on the line number for the first file specified", "line number"}
     });
 
     parser.process(args);
+}
+
+static QString toLocalFileName(const QString file)
+{
+    QUrl fileUrl(file);
+    return fileUrl.isValid() && fileUrl.isLocalFile() ? fileUrl.toLocalFile() : file;
 }
 
 NotepadNextApplication::NotepadNextApplication(int &argc, char **argv)
@@ -92,23 +102,42 @@ bool NotepadNextApplication::init()
 
     setWindowIcon(QIcon(QStringLiteral(":/icons/NotepadNext.png")));
 
+    settings = new ApplicationSettings(this);
+
     if (parser.isSet("reset-settings")) {
-        QSettings settings;
-        settings.clear();
+        QFileInfo original(settings->fileName());
+        const QString backup = original.canonicalFilePath() + QStringLiteral(".backup");
+
+        qInfo("Resetting application settings");
+        qInfo("Backuping up %s to %s", qUtf8Printable(settings->fileName()), qUtf8Printable(backup));
+
+        QFile::remove(backup);
+        QFile::rename(settings->fileName(), backup);
+
+        settings->clear();
     }
 
+    // Translation files are stored as a qresource
+    translationManager = new TranslationManager(this, QStringLiteral(":/i18n/"));
+
+    // The command line overrides the settings
     if (!parser.value("translation").isEmpty()) {
-        loadTranslation(QLocale(parser.value("translation")));
+        translationManager->loadTranslation(parser.value("translation"));
+    }
+    else if (!settings->translation().isEmpty()){
+        translationManager->loadTranslation(settings->translation());
     }
     else {
-        loadSystemDefaultTranslation();
+        translationManager->loadSystemDefaultTranslation();
     }
+
+    // This connection isn't needed since the application can not appropriately retranslate the UI at runtime
+    //connect(settings, &ApplicationSettings::translationChanged, translationManager, &TranslationManager::loadTranslationByName);
 
     luaState = new LuaState();
 
     recentFilesListManager = new RecentFilesListManager(this);
-    editorManager = new EditorManager(this);
-    settings = new Settings(this);
+    editorManager = new EditorManager(settings, this);
     sessionManager = new SessionManager(this);
 
     connect(editorManager, &EditorManager::editorCreated, recentFilesListManager, [=](ScintillaNext *editor) {
@@ -138,11 +167,11 @@ bool NotepadNextApplication::init()
     luabridge::setHideMetatables(false);
     luabridge::getGlobalNamespace(luaState->L)
         .beginNamespace("nn")
-            .beginClass<Settings>("Settings")
-                .addFunction("showMenuBar", &Settings::setShowMenuBar)
-                .addFunction("showToolBar", &Settings::setShowToolBar)
-                .addFunction("showTabBar", &Settings::setShowTabBar)
-                .addFunction("showStatusBar", &Settings::setShowStatusBar)
+            .beginClass<ApplicationSettings>("Settings")
+                .addFunction("showMenuBar", &ApplicationSettings::setShowMenuBar)
+                .addFunction("showToolBar", &ApplicationSettings::setShowToolBar)
+                .addFunction("showTabBar", &ApplicationSettings::setShowTabBar)
+                .addFunction("showStatusBar", &ApplicationSettings::setShowStatusBar)
             .endClass()
         .endNamespace();
     luabridge::setGlobal(luaState->L, settings, "settings");
@@ -177,20 +206,7 @@ bool NotepadNextApplication::init()
     });
 
     connect(this, &SingleApplication::instanceStarted, window, &MainWindow::bringWindowToForeground);
-
-    connect(this, &SingleApplication::receivedMessage, this, [&](quint32 instanceId, QByteArray message) {
-        Q_UNUSED(instanceId)
-
-        QDataStream stream(&message, QIODevice::ReadOnly);
-        QStringList args;
-
-        stream >> args;
-
-        QCommandLineParser parser;
-        parseCommandLine(parser, args);
-
-        openFiles(parser.positionalArguments());
-    }, Qt::QueuedConnection);
+    connect(this, &SingleApplication::receivedMessage, this, &NotepadNextApplication::receiveInfoFromSecondaryInstance, Qt::QueuedConnection);
 
     connect(this, &NotepadNextApplication::applicationStateChanged, this, [&](Qt::ApplicationState state) {
         if (state == Qt::ApplicationActive) {
@@ -215,6 +231,16 @@ bool NotepadNextApplication::init()
     }
 
     openFiles(parser.positionalArguments());
+
+    if (parser.isSet("n") && parser.positionalArguments().length() > 0) {
+        QString firstFile = parser.positionalArguments()[0];
+        ScintillaNext *editor = editorManager->getEditorByFilePath(toLocalFileName(firstFile));
+
+        if (editor) {
+            int n = parser.value("n").toInt();
+            editor->gotoLine(n - 1);
+        }
+    }
 
     // If the window does not have any editors (meaning the no files were
     // specified on the command line) then create a new empty file
@@ -259,6 +285,11 @@ QString NotepadNextApplication::getFileDialogFilter() const
     return getLuaState()->executeAndReturn<QString>("return DialogFilters()");
 }
 
+QString NotepadNextApplication::getFileDialogFilterForLanguage(const QString &language) const
+{
+    return getLuaState()->executeAndReturn<QString>(QString("return FilterForLanguage(\"%1\")").arg(language).toLatin1().constData());
+}
+
 QStringList NotepadNextApplication::getLanguages() const
 {
     return getLuaState()->executeAndReturn<QStringList>(
@@ -292,44 +323,7 @@ void NotepadNextApplication::setEditorLanguage(ScintillaNext *editor, const QStr
     getLuaState()->execute(QString("skip_tabs = %1").arg(editor->QObject::property("nn_skip_usetabs").isValid() ? "true" : "false").toLatin1().constData());
     getLuaState()->execute(QString("skip_tabwidth = %1").arg(editor->QObject::property("nn_skip_tabwidth").isValid() ? "true" : "false").toLatin1().constData());
 
-    getLuaState()->execute(R"(
-        local L = languages[languageName]
-
-        if not skip_tabs then
-            editor.UseTabs = (L.tabSettings or "tabs") == "tabs"
-        end
-        if not skip_tabwidth then
-            editor.TabWidth = L.tabSize or 4
-        end
-
-        editor.MarginWidthN[2] = L.disableFoldMargin and 0 or 16
-        if L.styles then
-            for name, style in pairs(L.styles) do
-                editor.StyleFore[style.id] = style.fgColor
-                editor.StyleBack[style.id] = style.bgColor
-
-                if style.fontStyle then
-                    editor.StyleBold[style.id] = (style.fontStyle & 1 == 1)
-                    editor.StyleItalic[style.id] = (style.fontStyle & 2 == 2)
-                    editor.StyleUnderline[style.id] = (style.fontStyle & 4 == 4)
-                    editor.StyleEOLFilled[style.id] = (style.fontStyle & 8 == 8)
-                end
-            end
-        end
-        if L.keywords then
-            for id, kw in pairs(L.keywords) do
-                editor.KeyWords[id] = kw
-            end
-        end
-        if L.properties then
-            for p,v in pairs(L.properties) do
-                editor.Property[p] = v
-            end
-        end
-
-        editor.Property["fold"] = "1"
-        editor.Property["fold.compact"] = "0"
-    )");
+    getLuaState()->execute(QString("SetLanguage(languageName)").toLatin1().constData());
 }
 
 QString NotepadNextApplication::detectLanguage(ScintillaNext *editor) const
@@ -378,50 +372,43 @@ QString NotepadNextApplication::detectLanguageFromContents(ScintillaNext *editor
     -- Grab a small chunk
     if editor.Length > 0 then
         editor:SetTargetRange(0, math.min(64, editor.Length))
-        return detectLanguageFromContents(editor.TargetText)
+        return DetectLanguageFromContents(editor.TargetText)
     end
 
     return "Text"
     )").toLatin1().constData());
 }
 
-void NotepadNextApplication::loadSystemDefaultTranslation()
-{
-    // The wrong translation file may be loaded when passing Locale::system() to loadTranslation function, e.g. "zh_CN" translation file will be loaded when the locale is "en_US". It's probably a Qt bug.
-    loadTranslation(QLocale(QLocale::system().name()));
-}
-
-void NotepadNextApplication::loadTranslation(QLocale locale)
+void NotepadNextApplication::sendInfoToPrimaryInstance()
 {
     qInfo(Q_FUNC_INFO);
 
-    // Translation files are stored as a qresource
-    const QString languagePath = QStringLiteral(":/i18n/");
-
-    // Load translation for NotepadNext e.g. "i18n/NotepadNext.en.qm"
-    if (translatorNpn.load(locale, QApplication::applicationName(), QString("_"), languagePath)) {
-        installTranslator(&translatorNpn);
-        qInfo("Loaded %s translation %s for Notepad Next", qUtf8Printable(locale.name()), qUtf8Printable(translatorNpn.filePath()));
-    } else {
-        qInfo("%s translation not found for Notepad Next", qUtf8Printable(locale.name()));
-    }
-
-    // Load translation for Qt components e.g. "i18n/qt_en.qm"
-    if (translatorQt.load(locale, QString("qt"), QString("_"), languagePath)) {
-        installTranslator(&translatorQt);
-        qInfo("Loaded %s translation %s for Qt components", qUtf8Printable(locale.name()), qUtf8Printable(translatorQt.filePath()));
-    } else {
-        qInfo("%s translation not found for Qt components", qUtf8Printable(locale.name()));
-    }
-}
-
-void NotepadNextApplication::sendInfoToPrimaryInstance()
-{
     QByteArray buffer;
     QDataStream stream(&buffer, QIODevice::WriteOnly);
 
     stream << arguments();
-    sendMessage(buffer);
+    const bool success = sendMessage(buffer);
+
+    if (!success) {
+        qWarning("sendMessage() unsuccessful");
+    }
+}
+
+void NotepadNextApplication::receiveInfoFromSecondaryInstance(quint32 instanceId, QByteArray message)
+{
+    qInfo(Q_FUNC_INFO);
+
+    Q_UNUSED(instanceId)
+
+    QDataStream stream(&message, QIODevice::ReadOnly);
+    QStringList args;
+
+    stream >> args;
+
+    QCommandLineParser parser;
+    parseCommandLine(parser, args);
+
+    openFiles(parser.positionalArguments());
 }
 
 bool NotepadNextApplication::isRunningAsAdmin() const
@@ -471,30 +458,18 @@ void NotepadNextApplication::openFiles(const QStringList &files)
     qInfo(Q_FUNC_INFO);
 
     for (const QString &file : files) {
-        QUrl fileUrl(file);
-        QString filePath = fileUrl.isValid() && fileUrl.isLocalFile() ? fileUrl.toLocalFile() : file;
-        window->openFile(filePath);
+        window->openFile(toLocalFileName(file));
     }
 }
 
 void NotepadNextApplication::loadSettings()
 {
-    QSettings qsettings;
-
-    settings->setRestorePreviousSession(qsettings.value("App/RestorePreviousSession", false).toBool());
-    settings->setRestoreUnsavedFiles(qsettings.value("App/RestoreUnsavedFiles", false).toBool());
-    settings->setRestoreTempFiles(qsettings.value("App/RestoreTempFiles", false).toBool());
-    recentFilesListManager->setFileList(qsettings.value("App/RecentFilesList").toStringList());
+    recentFilesListManager->setFileList(getSettings()->value("App/RecentFilesList").toStringList());
 }
 
 void NotepadNextApplication::saveSettings()
 {
-    QSettings qsettings;
-
-    qsettings.setValue("App/RestorePreviousSession", settings->restorePreviousSession());
-    qsettings.setValue("App/RestoreUnsavedFiles", settings->restoreUnsavedFiles());
-    qsettings.setValue("App/RestoreTempFiles", settings->restoreTempFiles());
-    qsettings.setValue("App/RecentFilesList", recentFilesListManager->fileList());
+    getSettings()->setValue("App/RecentFilesList", recentFilesListManager->fileList());
 }
 
 MainWindow *NotepadNextApplication::createNewWindow()
@@ -520,4 +495,21 @@ MainWindow *NotepadNextApplication::createNewWindow()
     });
 
     return window;
+}
+
+QStringList NotepadNextApplication::debugInfo() const
+{
+    QStringList info;
+
+    info.append(QStringLiteral("%1 v%2 %3").arg(applicationDisplayName(), applicationVersion(), APP_DISTRIBUTION));
+    info.append(QStringLiteral("Build Date/Time: %1 %2").arg(__DATE__, __TIME__));
+    info.append(QStringLiteral("Qt: %1").arg(qVersion()));
+    info.append(QStringLiteral("OS: %1").arg(QSysInfo::prettyProductName()));
+    info.append(QStringLiteral("Locale: %1").arg(QLocale::system().name()));
+    info.append(QStringLiteral("CPU: %1").arg(QSysInfo::currentCpuArchitecture()));
+    info.append(QStringLiteral("File Path: %1").arg(applicationFilePath()));
+    info.append(QStringLiteral("Arguments: %1").arg(arguments().join(' ')));
+    info.append(QStringLiteral("Config File: %1").arg(ApplicationSettings().fileName()));
+
+    return info;
 }

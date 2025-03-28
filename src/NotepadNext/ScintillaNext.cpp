@@ -97,6 +97,30 @@ ScintillaNext *ScintillaNext::fromFile(const QString &filePath, bool tryToCreate
     return editor;
 }
 
+QString ScintillaNext::eolModeToString(int eolMode)
+{
+    if (eolMode == SC_EOL_CRLF)
+        return QStringLiteral("crlf");
+    else if (eolMode == SC_EOL_CR)
+        return QStringLiteral("cr");
+    else if (eolMode == SC_EOL_LF)
+        return QStringLiteral("lf");
+    else
+        return QString(); // unknown
+}
+
+int ScintillaNext::stringToEolMode(QString eolMode)
+{
+    if (eolMode == QStringLiteral("crlf"))
+        return SC_EOL_CRLF;
+    else if (eolMode == QStringLiteral("cr"))
+        return SC_EOL_CR;
+    else if (eolMode == QStringLiteral("lf"))
+        return SC_EOL_LF;
+    else
+        return -1;
+}
+
 int ScintillaNext::allocateIndicator(const QString &name)
 {
     return indicatorResources.requestResource(name);
@@ -144,6 +168,36 @@ void ScintillaNext::cutAllowLine()
     else {
         cut();
     }
+}
+
+void ScintillaNext::modifyFoldLevels(int level, int action)
+{
+    const int totalLines = lineCount();
+
+    int line = 0;
+    while (line < totalLines) {
+        int foldFlags = foldLevel(line); // Even though its called fold level it contains several other flags
+        bool isHeader = foldFlags & SC_FOLDLEVELHEADERFLAG;
+        int actualLevel = (foldFlags & SC_FOLDLEVELNUMBERMASK) - SC_FOLDLEVELBASE;
+
+        if (isHeader && actualLevel == level) {
+            foldLine(line, action);
+            line = lastChild(line, -1) + 1;
+        }
+        else {
+            ++line;
+        }
+    }
+}
+
+void ScintillaNext::foldAllLevels(int level)
+{
+    modifyFoldLevels(level, SC_FOLDACTION_CONTRACT);
+}
+
+void ScintillaNext::unFoldAllLevels(int level)
+{
+    modifyFoldLevels(level, SC_FOLDACTION_EXPAND);
 }
 
 void ScintillaNext::deleteLeadingEmptyLines()

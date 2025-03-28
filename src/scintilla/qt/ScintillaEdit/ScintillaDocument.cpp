@@ -55,6 +55,7 @@ public:
     void NotifyDeleted(Document *doc, void *userData) noexcept override;
     void NotifyStyleNeeded(Document *doc, void *userData, Sci::Position endPos) override;
     void NotifyErrorOccurred(Document *doc, void *userData, Status status) override;
+    void NotifyGroupCompleted(Document *doc, void *userData) noexcept override;
 };
 
 WatcherHelper::WatcherHelper(ScintillaDocument *owner_) : owner(owner_) {
@@ -88,8 +89,12 @@ void WatcherHelper::NotifyErrorOccurred(Document *, void *, Status status) {
     emit owner->error_occurred(static_cast<int>(status));
 }
 
+void WatcherHelper::NotifyGroupCompleted(Document *, void *) noexcept {
+    // Needed to satisfy protocol. May implement an event in future.
+}
+
 ScintillaDocument::ScintillaDocument(QObject *parent, void *pdoc_) :
-    QObject(parent), pdoc(pdoc_), docWatcher(nullptr) {
+    QObject(parent), pdoc(static_cast<Scintilla::IDocumentEditable *>(pdoc_)), docWatcher(nullptr) {
     if (!pdoc) {
 	pdoc = new Document(DocumentOption::Default);
     }
@@ -153,8 +158,8 @@ bool ScintillaDocument::is_collecting_undo() {
     return (static_cast<Document *>(pdoc))->IsCollectingUndo();
 }
 
-void ScintillaDocument::begin_undo_action() {
-    (static_cast<Document *>(pdoc))->BeginUndoAction();
+void ScintillaDocument::begin_undo_action(bool coalesceWithPrior) {
+    (static_cast<Document *>(pdoc))->BeginUndoAction(coalesceWithPrior);
 }
 
 void ScintillaDocument::end_undo_action() {

@@ -18,9 +18,9 @@
 
 
 #include "FindReplaceDialog.h"
+#include "ApplicationSettings.h"
 #include "ui_FindReplaceDialog.h"
 
-#include <QSettings>
 #include <QStatusBar>
 #include <QLineEdit>
 #include <QKeyEvent>
@@ -49,7 +49,6 @@ FindReplaceDialog::FindReplaceDialog(ISearchResultsHandler *searchResults, MainW
 
     // Turn off the help button on the dialog
     setWindowFlag(Qt::WindowContextHelpButtonHint, false);
-
     ui->setupUi(this);
 
     // Get the current editor, and keep up the reference
@@ -148,8 +147,6 @@ FindReplaceDialog::FindReplaceDialog(ISearchResultsHandler *searchResults, MainW
 
     loadSettings();
 
-    connect(qApp, &QApplication::aboutToQuit, this, &FindReplaceDialog::saveSettings);
-
     changeTab(tabBar->currentIndex());
 }
 
@@ -194,6 +191,13 @@ void FindReplaceDialog::showEvent(QShowEvent *event)
     QDialog::showEvent(event);
 }
 
+void FindReplaceDialog::closeEvent(QCloseEvent *event)
+{
+    saveSettings();
+
+    QDialog::closeEvent(event);
+}
+
 static void updateComboList(QComboBox *comboBox, const QString &text)
 {
     // Block the signals while it is manipulated
@@ -222,7 +226,13 @@ void FindReplaceDialog::find()
 
     prepareToPerformSearch();
 
-    Sci_CharacterRange range = finder->findNext();
+    Sci_CharacterRange range;
+    if(!ui->checkBoxBackwardsDirection->isChecked()) {
+        range = finder->findNext();
+    }
+    else{
+         range = finder->findPrev();
+    }
 
     if (ScintillaNext::isRangeValid(range)) {
         if (finder->didLatestSearchWrapAround()) {
@@ -367,8 +377,8 @@ void FindReplaceDialog::transparencyToggled(bool on)
 
     if (on) {
         if (ui->radioOnLosingFocus->isChecked()) {
-           adjustOpacityWhenLosingFocus(true);
-           adjustOpacityAlways(false);
+            adjustOpacityWhenLosingFocus(true);
+            adjustOpacityAlways(false);
         }
         else {
             adjustOpacityWhenLosingFocus(false);
@@ -491,9 +501,11 @@ void FindReplaceDialog::loadSettings()
 {
     qInfo(Q_FUNC_INFO);
 
-    QSettings settings;
+    ApplicationSettings settings;
 
     settings.beginGroup("FindReplaceDialog");
+
+    restoreGeometry(settings.value("geometry").toByteArray());
 
     ui->comboFind->addItems(settings.value("RecentSearchList").toStringList());
     ui->comboReplace->addItems(settings.value("RecentReplaceList").toStringList());
@@ -533,10 +545,12 @@ void FindReplaceDialog::saveSettings()
 {
     qInfo(Q_FUNC_INFO);
 
-    QSettings settings;
+    ApplicationSettings settings;
 
     settings.beginGroup("FindReplaceDialog");
     settings.remove(""); // clear out any previous keys
+
+    settings.setValue("geometry", saveGeometry());
 
     QStringList recentSearches;
     for (int i = 0; i < ui->comboFind->count(); ++i) {
@@ -576,14 +590,22 @@ void FindReplaceDialog::savePosition()
 {
     qInfo(Q_FUNC_INFO);
 
-    position = pos();
+    lastClosedPosition = pos();
 }
 
 void FindReplaceDialog::restorePosition()
 {
     qInfo(Q_FUNC_INFO);
 
-    move(position);
+    ApplicationSettings settings;
+
+    if (settings.centerSearchDialog()) {
+        const QPoint centerPoint = parentWidget()->geometry().center();
+        move(centerPoint - rect().center());
+    }
+    else {
+        move(lastClosedPosition);
+    }
 }
 
 int FindReplaceDialog::computeSearchFlags()

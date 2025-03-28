@@ -44,6 +44,8 @@ public:
     virtual ~ScintillaNext();
 
     static ScintillaNext *fromFile(const QString &filePath, bool tryToCreate=false);
+    static QString eolModeToString(int eolMode);
+    static int stringToEolMode(QString eolMode);
 
     int allocateIndicator(const QString &name);
 
@@ -68,6 +70,10 @@ public:
     void deleteLine(int line);
 
     void cutAllowLine();
+
+    void modifyFoldLevels(int level, int action);
+    void foldAllLevels(int level);
+    void unFoldAllLevels(int level);
 
     void deleteLeadingEmptyLines();
     void deleteTrailingEmptyLines();
